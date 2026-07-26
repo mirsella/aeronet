@@ -69,7 +69,7 @@ web-sys = { workspace = true, features = [
 [features]
 default = ["self-signed"]
 ## Enables the `client` module.
-client = []
+client = ["tokio-tungstenite/connect"]
 ## Enable this when generating docs.
 document-features = ["dep:document-features"]
 ## Allows generating self-signed server certificates using [`rcgen`].

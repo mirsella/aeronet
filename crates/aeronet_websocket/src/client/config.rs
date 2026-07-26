@@ -1,11 +1,11 @@
 use {
     alloc::sync::Arc,
     rustls::{
-        RootCertStore,
         client::danger::{ServerCertVerified, ServerCertVerifier},
         crypto::WebPkiSupportedAlgorithms,
+        RootCertStore,
     },
-    tokio_tungstenite::{Connector, tungstenite::protocol::WebSocketConfig},
+    tokio_tungstenite::{tungstenite::protocol::WebSocketConfig, Connector},
 };
 
 /// Configuration for a [`WebSocketClient`] using [`tokio_tungstenite`].
@@ -149,7 +149,7 @@ struct NoServerVerification {
 impl Default for NoServerVerification {
     fn default() -> Self {
         Self {
-            supported_algorithms: rustls::crypto::aws_lc_rs::default_provider()
+            supported_algorithms: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms,
         }
     }
