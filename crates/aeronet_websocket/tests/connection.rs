@@ -20,6 +20,7 @@ use {
     bevy_platform::time::Instant,
     bytes::Bytes,
     core::{fmt::Debug, time::Duration},
+    std::{io, io::Read, net::TcpListener},
 };
 
 const PING: Bytes = Bytes::from_static(b"ping");
@@ -102,6 +103,49 @@ fn open_twice() {
             world.get::<Server>(server_entity).is_some()
         });
     }
+}
+
+#[test]
+fn removing_client_cancels_pending_handshake() {
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, WebSocketClientPlugin));
+
+    let client = app.world_mut().spawn_empty().id();
+    WebSocketClient::connect(
+        ClientConfig::builder().with_no_encryption(),
+        format!("ws://{address}"),
+    )
+    .apply(app.world_mut().entity_mut(client));
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for client connection"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to accept client connection: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+
+    let mut first_bytes = [0; 1024];
+    let handshake_len = stream.read(&mut first_bytes).unwrap();
+    assert!(handshake_len > 0, "client should start the handshake");
+
+    app.world_mut().despawn(client);
+    io::copy(&mut stream, &mut io::sink()).unwrap();
 }
 
 // test harness

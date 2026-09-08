@@ -11,6 +11,9 @@ pub async fn start(
     target: ConnectTarget,
     tx_connected: oneshot::Sender<ToConnected>,
 ) -> Result<Never, DisconnectReason> {
+    #[cfg(not(target_family = "wasm"))]
+    let mut tx_connected = tx_connected;
+
     let (connected, backend) = {
         #[cfg(target_family = "wasm")]
         {
@@ -30,13 +33,13 @@ pub async fn start(
 
         #[cfg(not(target_family = "wasm"))]
         {
-            use tokio_tungstenite::MaybeTlsStream;
+            use {futures::FutureExt, tokio_tungstenite::MaybeTlsStream};
 
             let target = target.map_err(ClientError::CreateTarget)?;
 
             debug!("Spawning backend task to connect to {:?}", target.uri());
 
-            let (stream, _) = {
+            let connect = {
                 let socket_config = Some(config.socket);
                 let disable_nagle = !config.nagle;
 
@@ -46,9 +49,14 @@ pub async fn start(
                     disable_nagle,
                     Some(config.connector),
                 )
-            }
-            .await
-            .map_err(ClientError::Connect)?;
+            };
+            futures::pin_mut!(connect);
+            let (stream, _) = futures::select! {
+                result = connect.fuse() => result.map_err(ClientError::Connect)?,
+                () = tx_connected.cancellation().fuse() => {
+                    return Err(SessionError::FrontendClosed.into());
+                }
+            };
 
             let socket = match stream.get_ref() {
                 MaybeTlsStream::Plain(socket) => socket,
