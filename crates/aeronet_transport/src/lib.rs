@@ -36,7 +36,7 @@ use {
     bevy_ecs::{prelude::*, schedule::SystemSet},
     bevy_platform::time::Instant,
     bevy_reflect::Reflect,
-    core::num::Saturating,
+    core::{num::Saturating, time::Duration},
     derive_more::{Add, AddAssign, Display, Error, Sub, SubAssign},
     lane::{LaneIndex, LaneKind},
     log::warn,
@@ -148,6 +148,18 @@ pub struct TransportConfig {
     /// [`Transport::memory_used`] is too high (you can use the [`visualizer`]
     /// to see real-time statistics).
     pub max_memory_usage: usize,
+    /// Maximum time to retain an incomplete message on an unreliable lane,
+    /// measured from its first received fragment.
+    ///
+    /// Expired messages are discarded during receive polling, even when no
+    /// packets arrive. Duplicate fragments do not extend this deadline.
+    /// Reliable messages never expire, because their acknowledged fragments
+    /// may no longer be available on the sender.
+    ///
+    /// Zero discards incomplete unreliable messages on the next poll or packet.
+    ///
+    /// By default, this is 5 seconds. The total memory limit still applies.
+    pub unreliable_reassembly_timeout: Duration,
     /// How many packet bytes we can flush out to the IO layer per second.
     ///
     /// This can be used to limit the outgoing bandwidth of this transport.
@@ -180,6 +192,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             max_memory_usage: 4 * 1024 * 1024,
+            unreliable_reassembly_timeout: Duration::from_secs(5),
             tx_bytes_per_sec: usize::MAX,
             packet_lost_threshold_factor: 1.5,
         }

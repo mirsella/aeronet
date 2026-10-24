@@ -14,9 +14,9 @@ use {
         size::MinSize,
     },
     alloc::vec::Vec,
-    bevy_platform::collections::HashMap,
+    bevy_platform::{collections::HashMap, time::Instant},
     bit_vec::BitVec,
-    core::{fmt, iter::FusedIterator},
+    core::{fmt, iter::FusedIterator, time::Duration},
     derive_more::{Display, Error},
     octs::{Bytes, chunks::ByteChunksExt},
     typesize::derive::TypeSize,
@@ -115,7 +115,7 @@ pub struct FragmentReceiver {
 }
 
 /// Received an invalid fragment when reassembling fragments into a message.
-#[derive(Debug, Clone, PartialEq, Eq, Display, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Display, Error, TypeSize)]
 pub enum ReassembleError {
     /// Already received a fragment with this index.
     #[display("already received fragment {index}")]
@@ -124,7 +124,7 @@ pub enum ReassembleError {
         index: usize,
     },
     /// Not enough free memory to buffer this fragment up.
-    #[display("out of memory - {left} / {required} bytes")]
+    #[display("out of memory - required {required} bytes, {left} bytes left")]
     OutOfMemory {
         /// Bytes of memory required.
         required: usize,
@@ -164,10 +164,33 @@ pub enum ReassembleError {
         /// Expected fragment length.
         expected: usize,
     },
+    /// Received a non-last fragment beyond the known end of the message.
+    #[display("received fragment {index} beyond last fragment {last}")]
+    BeyondLastFrag {
+        /// Index of the fragment received.
+        index: usize,
+        /// Index of the last fragment.
+        last: usize,
+    },
+    /// The fragment's offset and length cannot fit in the address space.
+    #[display(
+        "fragment {index} with maximum length {max_frag_len} and payload length {len} exceeds \
+         addressable memory"
+    )]
+    FragmentOffsetOverflow {
+        /// Index of the fragment received.
+        index: usize,
+        /// Maximum fragment length used to compute its offset.
+        max_frag_len: usize,
+        /// Length of the fragment received.
+        len: usize,
+    },
 }
 
-#[derive(Default, Clone, TypeSize)]
+#[derive(Clone, TypeSize)]
 struct MessageBuf {
+    #[typesize(skip)]
+    first_recv_at: Option<Instant>,
     last_frag_index: Option<usize>,
     max_frag_index: usize,
     num_frags_recv: usize,
@@ -200,6 +223,13 @@ impl FragmentReceiver {
         self.msgs.is_empty()
     }
 
+    pub(crate) fn expire(&mut self, now: Instant, timeout: Duration) {
+        self.msgs.retain(|_, buf| {
+            buf.first_recv_at
+                .is_none_or(|first| now.saturating_duration_since(first) < timeout)
+        });
+    }
+
     /// Receives a single message fragment created from [`split`] and attempts
     /// to reassemble it into a full message.
     ///
@@ -221,24 +251,22 @@ impl FragmentReceiver {
     /// so the receiver is forced to keep the fragments in memory. To avoid
     /// this, receivers define a memory limit via `mem_left`, and if buffering a
     /// packet will result in using too much memory, this returns a
-    /// [`ReassembleError::OutOfMemory`]. Note that this will just return an
-    /// error on out-of-memory, unlike [`TransportConfig::max_memory_usage`],
-    /// which will forcibly disconnect the session.
+    /// [`ReassembleError::OutOfMemory`]. This receiver only reports the error;
+    /// the transport disconnects rather than acknowledging rejected fragments.
     ///
     /// # Errors
     ///
     /// Errors if the fragment received is unexpected for the current state of
     /// reassembly.
     ///
-    /// Errors must not be treated as fatal, as they may happen due to network
-    /// conditions such as duplicated or lost packets. Errors will not cause any
-    /// invalid state.
+    /// [`ReassembleError::AlreadyReceivedFrag`] is harmless and can happen due
+    /// to duplicate packets or retransmissions. Other errors reject the
+    /// fragment without changing the reassembly state. They must not be
+    /// ignored when acknowledging reliable fragments.
     ///
     /// # Panics
     ///
     /// Panics if `max_frag_len` is 0.
-    ///
-    /// [`TransportConfig::max_memory_usage`]: crate::TransportConfig::max_memory_usage
     pub fn reassemble(
         &mut self,
         max_frag_len: MinSize,
@@ -247,28 +275,87 @@ impl FragmentReceiver {
         position: FragmentPosition,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, ReassembleError> {
+        // Standalone reassembly has no expiry policy and must remain usable
+        // without a clock on no_std platforms.
+        self.reassemble_with_time(max_frag_len, mem_left, msg_seq, position, payload, None)
+    }
+
+    pub(crate) fn reassemble_with_time(
+        &mut self,
+        max_frag_len: MinSize,
+        mem_left: usize,
+        msg_seq: MessageSeq,
+        position: FragmentPosition,
+        payload: &[u8],
+        recv_at: Option<Instant>,
+    ) -> Result<Option<Vec<u8>>, ReassembleError> {
         assert!(max_frag_len.0 > 0);
 
-        let buf = self.msgs.entry(msg_seq).or_default();
+        let buf = self.msgs.get(&msg_seq);
         let frag_index = usize::from(position.index());
 
         // check if this fragment has been received yet
-        if buf.frag_indices_recv.get(frag_index) == Some(true) {
+        if buf.is_some_and(|buf| buf.frag_indices_recv.get(frag_index) == Some(true)) {
             return Err(ReassembleError::AlreadyReceivedFrag { index: frag_index });
         }
 
+        // Validate before allocating or changing the buffer. In particular,
+        // fragments beyond a known last index must not count towards
+        // completion.
+        if position.is_last() {
+            if let Some(buf) = buf {
+                if let Some(last) = buf.last_frag_index {
+                    return Err(ReassembleError::AlreadyReceivedLastFrag {
+                        index: frag_index,
+                        last,
+                    });
+                }
+                if frag_index < buf.max_frag_index {
+                    return Err(ReassembleError::InvalidLastFrag {
+                        index: frag_index,
+                        max: buf.max_frag_index,
+                    });
+                }
+            }
+        } else {
+            if payload.len() != usize::from(max_frag_len) {
+                return Err(ReassembleError::InvalidPayloadLength {
+                    index: frag_index,
+                    len: payload.len(),
+                    expected: usize::from(max_frag_len),
+                });
+            }
+            if let Some(last) = buf.and_then(|buf| buf.last_frag_index)
+                && frag_index > last
+            {
+                return Err(ReassembleError::BeyondLastFrag {
+                    index: frag_index,
+                    last,
+                });
+            }
+        }
+
         // copy the payload data into the buffer
-        let start = frag_index * usize::from(max_frag_len);
-        let end = start + payload.len();
+        let end = frag_index
+            .checked_mul(usize::from(max_frag_len))
+            .and_then(|start| start.checked_add(payload.len()))
+            .ok_or_else(|| ReassembleError::FragmentOffsetOverflow {
+                index: frag_index,
+                max_frag_len: usize::from(max_frag_len),
+                len: payload.len(),
+            })?;
+        let start = end - payload.len();
 
         // try to resize buffers to make room for this fragment,
         // checking if we have enough memory
-        let payload_mem_required = end.saturating_sub(buf.payload.capacity());
-        let indices_mem_required = frag_index
-            .saturating_sub(buf.frag_indices_recv.capacity())
+        let payload_capacity = buf.map_or(0, |buf| buf.payload.capacity());
+        let indices_capacity = buf.map_or(0, |buf| buf.frag_indices_recv.capacity());
+        let payload_mem_required = end.saturating_sub(payload_capacity);
+        let indices_mem_required = (frag_index + 1)
+            .saturating_sub(indices_capacity)
             .div_ceil(8);
 
-        let mem_required = payload_mem_required + indices_mem_required;
+        let mem_required = payload_mem_required.saturating_add(indices_mem_required);
         // we *may* end up reserving more memory than `mem_required`,
         // but this should be sufficient to prevent ridiculously sized allocs
         // and anyway, if we go over the memory limit later, we'll catch it
@@ -280,6 +367,14 @@ impl FragmentReceiver {
             });
         }
 
+        let buf = self.msgs.entry(msg_seq).or_insert_with(|| MessageBuf {
+            first_recv_at: recv_at,
+            last_frag_index: None,
+            max_frag_index: 0,
+            num_frags_recv: 0,
+            frag_indices_recv: BitVec::new(),
+            payload: Vec::new(),
+        });
         let new_payload_len = buf.payload.len().max(end);
         buf.payload.resize(new_payload_len, 0);
 
@@ -288,31 +383,12 @@ impl FragmentReceiver {
 
         // update some meta stuff depending on if this is the last frag or not
         if position.is_last() {
-            if let Some(last) = buf.last_frag_index {
-                return Err(ReassembleError::AlreadyReceivedLastFrag {
-                    index: frag_index,
-                    last,
-                });
-            }
-
-            if frag_index < buf.max_frag_index {
-                return Err(ReassembleError::InvalidLastFrag {
-                    index: frag_index,
-                    max: buf.max_frag_index,
-                });
-            }
-
             buf.last_frag_index = Some(frag_index);
-        } else if payload.len() != usize::from(max_frag_len) {
-            return Err(ReassembleError::InvalidPayloadLength {
-                index: frag_index,
-                len: payload.len(),
-                expected: usize::from(max_frag_len),
-            });
         }
         buf.payload[start..end].copy_from_slice(payload);
 
-        // only update the buffer meta once we know there are no more error paths
+        // only update the buffer meta once we know there are no more error
+        // paths
         buf.frag_indices_recv.set(frag_index, true);
         buf.max_frag_index = buf.max_frag_index.max(frag_index);
 
@@ -341,7 +417,151 @@ mod tests {
 
     use {super::*, std::println};
 
-    // TODO
+    #[test]
+    fn rejected_fragment_does_not_create_a_buffer() {
+        let mut recv = FragmentReceiver::default();
+        assert!(matches!(
+            recv.reassemble(
+                MinSize(4),
+                0,
+                MessageSeq::new(0),
+                FragmentPosition::last(1u16).unwrap(),
+                b"last",
+            ),
+            Err(ReassembleError::OutOfMemory { .. })
+        ));
+        assert!(recv.is_empty());
+        assert_eq!(recv.msgs.capacity(), 0);
+
+        assert!(matches!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                MessageSeq::new(0),
+                FragmentPosition::ZERO_NON_LAST,
+                b"bad",
+            ),
+            Err(ReassembleError::InvalidPayloadLength { .. })
+        ));
+        assert!(recv.is_empty());
+        assert_eq!(recv.msgs.capacity(), 0);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn fragment_offset_overflow_does_not_allocate() {
+        let mut recv = FragmentReceiver::default();
+        assert!(matches!(
+            recv.reassemble(
+                MinSize::MAX,
+                usize::MAX,
+                MessageSeq::new(0),
+                FragmentPosition::last(1u16).unwrap(),
+                b"last",
+            ),
+            Err(ReassembleError::FragmentOffsetOverflow { .. })
+        ));
+        assert!(recv.is_empty());
+        assert_eq!(recv.msgs.capacity(), 0);
+    }
+
+    #[test]
+    fn rejected_fragment_does_not_change_existing_buffer() {
+        let mut recv = FragmentReceiver::default();
+        let seq = MessageSeq::new(0);
+        recv.reassemble(
+            MinSize(4),
+            usize::MAX,
+            seq,
+            FragmentPosition::ZERO_NON_LAST,
+            b"aaaa",
+        )
+        .unwrap();
+        let before = recv.msgs[&seq].clone();
+        assert!(before.first_recv_at.is_none());
+        let payload_capacity = recv.msgs[&seq].payload.capacity();
+        let indices_capacity = recv.msgs[&seq].frag_indices_recv.capacity();
+
+        assert!(matches!(
+            recv.reassemble(
+                MinSize(4),
+                0,
+                seq,
+                FragmentPosition::last(100u16).unwrap(),
+                b"b"
+            ),
+            Err(ReassembleError::OutOfMemory { .. })
+        ));
+        assert!(matches!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                seq,
+                FragmentPosition::non_last(100u16).unwrap(),
+                b"bad"
+            ),
+            Err(ReassembleError::InvalidPayloadLength { .. })
+        ));
+        let after = &recv.msgs[&seq];
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(after.payload.capacity(), payload_capacity);
+        assert_eq!(after.frag_indices_recv, before.frag_indices_recv);
+        assert_eq!(after.frag_indices_recv.capacity(), indices_capacity);
+        assert_eq!(after.last_frag_index, before.last_frag_index);
+        assert_eq!(after.max_frag_index, before.max_frag_index);
+        assert_eq!(after.num_frags_recv, before.num_frags_recv);
+    }
+
+    #[test]
+    fn fragments_beyond_last_cannot_complete_a_message() {
+        let mut recv = FragmentReceiver::default();
+        let seq = MessageSeq::new(0);
+        assert_eq!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                seq,
+                FragmentPosition::last(2u16).unwrap(),
+                b"c"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                seq,
+                FragmentPosition::non_last(3u16).unwrap(),
+                b"bad!"
+            )
+            .unwrap_err(),
+            ReassembleError::BeyondLastFrag { index: 3, last: 2 }
+        );
+        assert_eq!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                seq,
+                FragmentPosition::ZERO_NON_LAST,
+                b"aaaa"
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            recv.reassemble(
+                MinSize(4),
+                usize::MAX,
+                seq,
+                FragmentPosition::non_last(1u16).unwrap(),
+                b"bbbb"
+            )
+            .unwrap(),
+            Some(b"aaaabbbbc".to_vec())
+        );
+        assert!(recv.is_empty());
+    }
 
     #[test]
     fn round_trip() {
