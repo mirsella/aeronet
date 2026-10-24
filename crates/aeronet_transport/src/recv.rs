@@ -337,8 +337,16 @@ fn recv_packet(
 
     let mut frag_index = Saturating(0);
     let mut frags_recv = Saturating(0);
+    let mut ack_credit = None;
     while packet.has_remaining() {
-        match recv_frag(transport, config, recv_at, &mut packet) {
+        match recv_frag(
+            transport,
+            config,
+            recv_at,
+            &mut packet,
+            &header,
+            &mut ack_credit,
+        ) {
             Ok(()) => {
                 frags_recv += 1;
                 trace!(
@@ -437,6 +445,8 @@ fn recv_frag(
     config: &TransportConfig,
     recv_at: Instant,
     packet: &mut &[u8],
+    header: &PacketHeader,
+    ack_credit: &mut Option<usize>,
 ) -> Result<(), RecvError> {
     let frag = packet
         .read::<Fragment>()
@@ -477,6 +487,15 @@ fn recv_frag(
         .max_memory_usage
         .saturating_sub(transport.memory_used());
     if prepared.memory_required > memory_left {
+        // Borrow only memory that this packet's ACKs will release after
+        // acceptance. Do not commit ACK state if any later fragment
+        // rejects the packet.
+        let credit = *ack_credit.get_or_insert_with(|| pending_ack_memory(transport, header));
+        memory_left = config
+            .max_memory_usage
+            .saturating_sub(transport.memory_used().saturating_sub(credit));
+    }
+    if prepared.memory_required > memory_left {
         let candidates = transport
             .recv
             .unreliable_eviction_candidates(index, frag.header.seq);
@@ -488,9 +507,11 @@ fn recv_frag(
                 .expect("candidate came from this lane list")
                 .frags
                 .discard(seq);
-            memory_left = config
-                .max_memory_usage
-                .saturating_sub(transport.memory_used());
+            memory_left = config.max_memory_usage.saturating_sub(
+                transport
+                    .memory_used()
+                    .saturating_sub(ack_credit.unwrap_or(0)),
+            );
             if prepared.memory_required <= memory_left {
                 break;
             }
@@ -524,6 +545,34 @@ fn recv_frag(
     }
 
     Ok(())
+}
+
+fn pending_ack_memory(transport: &Transport, header: &PacketHeader) -> usize {
+    let mut fragments = HashSet::<_>::default();
+    let mut released = 0;
+    for seq in header.acks.seqs() {
+        let Some(packet) = transport.flushed_packets.get(seq.0.0) else {
+            continue;
+        };
+        released += packet.frags.extra_size();
+        for path in &packet.frags {
+            // A fragment can have been retransmitted in several acknowledged
+            // packets.
+            if !fragments.insert(*path) {
+                continue;
+            }
+            let lane = &transport.send.lanes[usize::from(path.lane_index.0)];
+            if let Some(fragment) = lane
+                .sent_msgs
+                .get(&path.msg_seq)
+                .and_then(|message| message.frags.get(usize::from(path.frag_index)))
+                .and_then(Option::as_ref)
+            {
+                released += fragment.extra_size();
+            }
+        }
+    }
+    released
 }
 
 fn recv_on_lane(
@@ -654,6 +703,61 @@ mod tests {
     }
 
     #[test]
+    fn ack_memory_credit_counts_retransmitted_payload_only_once() {
+        use typesize::TypeSize;
+        let now = Instant::now();
+        let mut sender = transport(LaneKind::ReliableOrdered, now, 1200);
+        sender
+            .send
+            .push(LANE, Bytes::from(vec![7; 1024]), now)
+            .unwrap();
+        assert_eq!(flush_on(&mut sender, now, 1200).count(), 1);
+        let mut header = PacketHeader {
+            seq: PacketSeq::new(0),
+            acks: Acknowledge::default(),
+        };
+        header.acks.ack(PacketSeq::new(0));
+        let single = super::pending_ack_memory(&sender, &header);
+        let retransmit = sender.flushed_packets.get(0).unwrap().clone();
+        let metadata = retransmit.frags.extra_size();
+        sender.flushed_packets.insert(1, retransmit);
+        header.acks.ack(PacketSeq::new(1));
+        assert_eq!(
+            super::pending_ack_memory(&sender, &header),
+            single + metadata
+        );
+    }
+
+    #[test]
+    fn piggybacked_acks_release_memory_for_valid_reliable_payloads() {
+        let now = Instant::now();
+        for kind in [LaneKind::ReliableOrdered, LaneKind::ReliableUnordered] {
+            let mut sender = transport(kind, now, 1200);
+            let mut peer = transport(kind, now, 1200);
+            let key = sender
+                .send
+                .push(LANE, Bytes::from(vec![7; 1024]), now)
+                .unwrap();
+            for payload in flush_on(&mut sender, now, 1200) {
+                recv_on(&mut peer, &TransportConfig::default(), now, &payload).unwrap();
+            }
+            let config = TransportConfig {
+                max_memory_usage: sender.memory_used(),
+                ..TransportConfig::default()
+            };
+            peer.send.push(LANE, Bytes::from(vec![8; 64]), now).unwrap();
+            for payload in flush_on(&mut peer, now, 1200) {
+                recv_on(&mut sender, &config, now, &payload).unwrap();
+            }
+            assert!(sender.memory_used() <= config.max_memory_usage);
+            assert_eq!(sender.recv.acks.drain().collect::<Vec<_>>(), [key]);
+            let messages = sender.recv.msgs.drain().collect::<Vec<_>>();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].payload.as_slice(), &[8; 64]);
+        }
+    }
+
+    #[test]
     fn peer_acks_are_processed_only_after_fragment_acceptance() {
         let now = Instant::now();
         for failure in [None, Some(false), Some(true)] {
@@ -668,7 +772,8 @@ mod tests {
             }
             if failure == Some(true) {
                 peer.send
-                    .push(LANE, Bytes::from_static(b"rejected"), now)
+                    // Exceed both the released payload and flushed-path metadata.
+                    .push(LANE, Bytes::from(vec![8; 32]), now)
                     .unwrap();
             }
             let mut packets = flush_on(&mut peer, now, 64).collect::<Vec<_>>();
@@ -770,7 +875,8 @@ mod tests {
             let mut packets = flush_on(&mut sender, now, 64)
                 .collect::<Vec<_>>()
                 .into_iter();
-            let first = packets.next().unwrap(); // last fragment allocates the whole message
+            let first = packets.next().unwrap(); // last fragment allocates the
+            // whole message
             let config = TransportConfig::default();
             recv_on(&mut receiver, &config, now, &first).unwrap();
             let older = partial_packet(&receiver, 0, 0, 3);
