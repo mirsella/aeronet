@@ -199,6 +199,20 @@ struct MessageBuf {
     payload: Vec<u8>,
 }
 
+/// Validated fragment layout. Its message must not be modified or evicted
+/// between preparation and insertion.
+#[derive(Debug)]
+pub(crate) struct PreparedFragment<'a> {
+    seq: MessageSeq,
+    index: usize,
+    start: usize,
+    end: usize,
+    num_indices: usize,
+    last: bool,
+    payload: &'a [u8],
+    pub(crate) memory_required: usize,
+}
+
 impl fmt::Debug for FragmentReceiver {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let seqs = self.msgs.keys().collect::<Vec<_>>();
@@ -209,6 +223,26 @@ impl fmt::Debug for FragmentReceiver {
 }
 
 impl FragmentReceiver {
+    pub(crate) fn discard_before(&mut self, pending: MessageSeq) {
+        self.msgs.retain(|seq, _| *seq >= pending);
+    }
+
+    pub(crate) fn eviction_candidates(
+        &self,
+        protected: Option<MessageSeq>,
+    ) -> impl Iterator<Item = (MessageSeq, Instant)> + '_ {
+        self.msgs.iter().filter_map(move |(seq, msg)| {
+            (Some(*seq) != protected)
+                .then_some(msg.first_recv_at)
+                .flatten()
+                .map(|at| (*seq, at))
+        })
+    }
+
+    pub(crate) fn discard(&mut self, seq: MessageSeq) {
+        self.msgs.remove(&seq);
+    }
+
     /// Gets the number of messages which are currently being reassembled, but
     /// have not been fully reassembled yet.
     #[must_use]
@@ -275,20 +309,31 @@ impl FragmentReceiver {
         position: FragmentPosition,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, ReassembleError> {
+        let Some(prepared) = self.prepare(max_frag_len, msg_seq, position, payload)? else {
+            // Keep the public 0.21 duplicate result. The transport uses prepare
+            // directly and accepts duplicates without allocating or evicting.
+            return Err(ReassembleError::AlreadyReceivedFrag {
+                index: usize::from(position.index()),
+            });
+        };
+        if prepared.memory_required > mem_left {
+            return Err(ReassembleError::OutOfMemory {
+                required: prepared.memory_required,
+                left: mem_left,
+            });
+        }
         // Standalone reassembly has no expiry policy and must remain usable
         // without a clock on no_std platforms.
-        self.reassemble_with_time(max_frag_len, mem_left, msg_seq, position, payload, None)
+        Ok(self.insert_prepared(prepared, None))
     }
 
-    pub(crate) fn reassemble_with_time(
-        &mut self,
+    pub(crate) fn prepare<'a>(
+        &self,
         max_frag_len: MinSize,
-        mem_left: usize,
         msg_seq: MessageSeq,
         position: FragmentPosition,
-        payload: &[u8],
-        recv_at: Option<Instant>,
-    ) -> Result<Option<Vec<u8>>, ReassembleError> {
+        payload: &'a [u8],
+    ) -> Result<Option<PreparedFragment<'a>>, ReassembleError> {
         assert!(max_frag_len.0 > 0);
 
         let buf = self.msgs.get(&msg_seq);
@@ -296,7 +341,7 @@ impl FragmentReceiver {
 
         // check if this fragment has been received yet
         if buf.is_some_and(|buf| buf.frag_indices_recv.get(frag_index) == Some(true)) {
-            return Err(ReassembleError::AlreadyReceivedFrag { index: frag_index });
+            return Ok(None);
         }
 
         // Validate before allocating or changing the buffer. In particular,
@@ -335,39 +380,50 @@ impl FragmentReceiver {
             }
         }
 
-        // copy the payload data into the buffer
-        let end = frag_index
+        // Validate the payload range without allocating.
+        let overflow = || ReassembleError::FragmentOffsetOverflow {
+            index: frag_index,
+            max_frag_len: usize::from(max_frag_len),
+            len: payload.len(),
+        };
+        let start = frag_index
             .checked_mul(usize::from(max_frag_len))
-            .and_then(|start| start.checked_add(payload.len()))
-            .ok_or_else(|| ReassembleError::FragmentOffsetOverflow {
-                index: frag_index,
-                max_frag_len: usize::from(max_frag_len),
-                len: payload.len(),
-            })?;
-        let start = end - payload.len();
+            .ok_or_else(overflow)?;
+        let end = start.checked_add(payload.len()).ok_or_else(overflow)?;
 
         // try to resize buffers to make room for this fragment,
         // checking if we have enough memory
         let payload_capacity = buf.map_or(0, |buf| buf.payload.capacity());
         let indices_capacity = buf.map_or(0, |buf| buf.frag_indices_recv.capacity());
         let payload_mem_required = end.saturating_sub(payload_capacity);
-        let indices_mem_required = (frag_index + 1)
-            .saturating_sub(indices_capacity)
-            .div_ceil(8);
+        let num_indices = frag_index.checked_add(1).ok_or_else(overflow)?;
+        let indices_mem_required = num_indices.saturating_sub(indices_capacity).div_ceil(8);
 
-        let mem_required = payload_mem_required.saturating_add(indices_mem_required);
-        // we *may* end up reserving more memory than `mem_required`,
+        let memory_required = payload_mem_required
+            .checked_add(indices_mem_required)
+            .ok_or_else(overflow)?;
+        // we *may* end up reserving more memory than `memory_required`,
         // but this should be sufficient to prevent ridiculously sized allocs
         // and anyway, if we go over the memory limit later, we'll catch it
         // somewhere else
-        if mem_required > mem_left {
-            return Err(ReassembleError::OutOfMemory {
-                required: mem_required,
-                left: mem_left,
-            });
-        }
+        Ok(Some(PreparedFragment {
+            seq: msg_seq,
+            index: frag_index,
+            start,
+            end,
+            num_indices,
+            last: position.is_last(),
+            payload,
+            memory_required,
+        }))
+    }
 
-        let buf = self.msgs.entry(msg_seq).or_insert_with(|| MessageBuf {
+    pub(crate) fn insert_prepared(
+        &mut self,
+        frag: PreparedFragment<'_>,
+        recv_at: Option<Instant>,
+    ) -> Option<Vec<u8>> {
+        let buf = self.msgs.entry(frag.seq).or_insert_with(|| MessageBuf {
             first_recv_at: recv_at,
             last_frag_index: None,
             max_frag_index: 0,
@@ -375,38 +431,40 @@ impl FragmentReceiver {
             frag_indices_recv: BitVec::new(),
             payload: Vec::new(),
         });
-        let new_payload_len = buf.payload.len().max(end);
-        buf.payload.resize(new_payload_len, 0);
+        buf.payload.resize(buf.payload.len().max(frag.end), 0);
 
-        let grow_len = (frag_index + 1).saturating_sub(buf.frag_indices_recv.len());
+        let grow_len = frag.num_indices.saturating_sub(buf.frag_indices_recv.len());
         buf.frag_indices_recv.grow(grow_len, false);
 
         // update some meta stuff depending on if this is the last frag or not
-        if position.is_last() {
-            buf.last_frag_index = Some(frag_index);
+        if frag.last {
+            buf.last_frag_index = Some(frag.index);
         }
-        buf.payload[start..end].copy_from_slice(payload);
+        buf.payload
+            .get_mut(frag.start..frag.end)
+            .expect("prepared fragment range fits the resized payload")
+            .copy_from_slice(frag.payload);
 
         // only update the buffer meta once we know there are no more error
         // paths
-        buf.frag_indices_recv.set(frag_index, true);
-        buf.max_frag_index = buf.max_frag_index.max(frag_index);
+        buf.frag_indices_recv.set(frag.index, true);
+        buf.max_frag_index = buf.max_frag_index.max(frag.index);
 
         // if we've fully reassembled the message, we can return it now
         if buf
             .last_frag_index
             .is_some_and(|last| buf.num_frags_recv >= last)
         {
-            let buf = self.msgs.remove(&msg_seq).expect(
+            let buf = self.msgs.remove(&frag.seq).expect(
                 "we already have a mut ref to the buffer at this key, so we should be able to \
                  remove and take ownership of it",
             );
-            Ok(Some(buf.payload))
+            Some(buf.payload)
         } else {
             // this happens separately from the other buffer meta update
             // so that the `if` condition above works properly
             buf.num_frags_recv += 1;
-            Ok(None)
+            None
         }
     }
 }
@@ -416,6 +474,30 @@ mod tests {
     extern crate std;
 
     use {super::*, std::println};
+
+    #[test]
+    fn standalone_duplicate_keeps_021_error_without_a_clock() {
+        let mut recv = FragmentReceiver::default();
+        let seq = MessageSeq::new(0);
+        let position = FragmentPosition::ZERO_NON_LAST;
+        assert_eq!(
+            recv.reassemble(MinSize(4), usize::MAX, seq, position, b"aaaa"),
+            Ok(None)
+        );
+        let before = recv.msgs[&seq].clone();
+        assert_eq!(
+            recv.reassemble(MinSize(4), 0, seq, position, b"aaaa"),
+            Err(ReassembleError::AlreadyReceivedFrag { index: 0 })
+        );
+        assert!(
+            recv.prepare(MinSize(4), seq, position, b"aaaa")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(recv.msgs[&seq].payload, before.payload);
+        assert_eq!(recv.msgs[&seq].frag_indices_recv, before.frag_indices_recv);
+        assert!(recv.msgs[&seq].first_recv_at.is_none());
+    }
 
     #[test]
     fn rejected_fragment_does_not_create_a_buffer() {

@@ -54,6 +54,27 @@ pub struct TransportRecv {
 pub struct RecvBuffer<T: TypeSize>(Vec<T>);
 
 impl TransportRecv {
+    fn unreliable_eviction_candidates(
+        &self,
+        protected_lane: usize,
+        protected_seq: MessageSeq,
+    ) -> Vec<(usize, MessageSeq, Instant)> {
+        let mut candidates = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| lane.kind().reliability() == LaneReliability::Unreliable)
+            .flat_map(|(index, lane)| {
+                let protected = (index == protected_lane).then_some(protected_seq);
+                lane.frags
+                    .eviction_candidates(protected)
+                    .map(move |(seq, at)| (index, seq, at))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(_, _, at)| *at);
+        candidates
+    }
+
     pub(crate) fn new(lanes: impl IntoIterator<Item = impl Into<LaneKind>>) -> Self {
         Self {
             lanes: lanes
@@ -270,10 +291,11 @@ pub enum RecvError {
 /// receive polling, including when this function is called outside the plugin.
 /// Subsequent calls return the original error without processing more packets.
 ///
-/// A failed packet is not acknowledged, but preceding fragments and peer
-/// acknowledgements may already have been committed. Do not retry a failed
-/// transport; discard it or let the plugin disconnect it. Harmless duplicate
-/// fragments and messages succeed and are acknowledged normally.
+/// A failed packet is not acknowledged and its peer acknowledgements are
+/// ignored, but preceding fragments may already have been committed. Do not
+/// retry a failed transport; discard it or let the plugin disconnect it.
+/// Harmless duplicate fragments and messages succeed and are acknowledged
+/// normally.
 pub fn recv_on(
     transport: &mut Transport,
     config: &TransportConfig,
@@ -313,16 +335,6 @@ fn recv_packet(
         packet.len()
     );
 
-    transport.recv.acks.0.extend(packet_acks_to_msg_keys(
-        &mut transport.flushed_packets,
-        &mut transport.send.lanes,
-        &mut transport.rtt,
-        &mut transport.stats.packet_acks_recv,
-        &mut transport.stats.msg_acks_recv,
-        recv_at,
-        header.acks.seqs(),
-    ));
-
     let mut frag_index = Saturating(0);
     let mut frags_recv = Saturating(0);
     while packet.has_remaining() {
@@ -354,6 +366,15 @@ fn recv_packet(
     // An ACK retires every reliable fragment in this packet on the sender.
     // Only acknowledge after all fragments have been accepted or deduplicated.
     transport.peer_acks.ack(header.seq);
+    transport.recv.acks.0.extend(packet_acks_to_msg_keys(
+        &mut transport.flushed_packets,
+        &mut transport.send.lanes,
+        &mut transport.rtt,
+        &mut transport.stats.packet_acks_recv,
+        &mut transport.stats.msg_acks_recv,
+        recv_at,
+        header.acks.seqs(),
+    ));
     Ok(())
 }
 
@@ -422,13 +443,11 @@ fn recv_frag(
         .map_err(|_| RecvError::ReadFragment)?;
     let lane_index = frag.header.lane;
 
-    let memory_left = config
-        .max_memory_usage
-        .saturating_sub(transport.memory_used());
+    let index = usize::from(lane_index.0);
     let lane = transport
         .recv
         .lanes
-        .get_mut(usize::from(lane_index.0))
+        .get(index)
         .ok_or(RecvError::InvalidLane { lane: lane_index })?;
     // Check before reassembly, otherwise a late subset of an already completed
     // message would allocate a new buffer which can never complete.
@@ -441,18 +460,54 @@ fn recv_frag(
         lane_index.0.0, frag.header.seq.0.0, frag.header.position,
     );
 
-    let msg = match lane.frags.reassemble_with_time(
-        transport.send.max_frag_len,
-        memory_left,
-        frag.header.seq,
-        frag.header.position,
-        &frag.payload,
-        Some(recv_at),
-    ) {
-        Ok(msg) => msg,
-        Err(ReassembleError::AlreadyReceivedFrag { .. }) => return Ok(()),
-        Err(err) => return Err(RecvError::Reassemble(err)),
+    let Some(prepared) = lane
+        .frags
+        .prepare(
+            transport.send.max_frag_len,
+            frag.header.seq,
+            frag.header.position,
+            &frag.payload,
+        )
+        .map_err(RecvError::Reassemble)?
+    else {
+        return Ok(());
     };
+
+    let mut memory_left = config
+        .max_memory_usage
+        .saturating_sub(transport.memory_used());
+    if prepared.memory_required > memory_left {
+        let candidates = transport
+            .recv
+            .unreliable_eviction_candidates(index, frag.header.seq);
+        for (evict_lane, seq, _) in candidates {
+            transport
+                .recv
+                .lanes
+                .get_mut(evict_lane)
+                .expect("candidate came from this lane list")
+                .frags
+                .discard(seq);
+            memory_left = config
+                .max_memory_usage
+                .saturating_sub(transport.memory_used());
+            if prepared.memory_required <= memory_left {
+                break;
+            }
+        }
+        if prepared.memory_required > memory_left {
+            return Err(RecvError::Reassemble(ReassembleError::OutOfMemory {
+                required: prepared.memory_required,
+                left: memory_left,
+            }));
+        }
+    }
+    let lane = transport
+        .recv
+        .lanes
+        .get_mut(index)
+        .expect("lane was validated above");
+    let msg = lane.frags.insert_prepared(prepared, Some(recv_at));
 
     if let Some(msg) = msg {
         let msgs_with_lane =
@@ -462,6 +517,9 @@ fn recv_frag(
                 payload: msg,
             });
         transport.recv.msgs.0.extend(msgs_with_lane);
+        if let LaneState::UnreliableSequenced { pending } = lane.state {
+            lane.frags.discard_before(pending);
+        }
         trace!("Fragment finished reassembling this message");
     }
 
@@ -583,6 +641,316 @@ mod tests {
             packet.write(&frag).unwrap();
         }
         packet
+    }
+
+    fn partial_packet(transport: &Transport, lane: u32, seq: u16, index: u16) -> Vec<u8> {
+        let mut frag = fragment(
+            seq,
+            FragmentPosition::non_last(index).unwrap(),
+            &vec![7; usize::from(transport.send.max_frag_len)],
+        );
+        frag.header.lane = LaneIndex::new(lane);
+        packet(seq, [frag])
+    }
+
+    #[test]
+    fn peer_acks_are_processed_only_after_fragment_acceptance() {
+        let now = Instant::now();
+        for failure in [None, Some(false), Some(true)] {
+            let mut sender = transport(LaneKind::ReliableOrdered, now, 64);
+            let mut peer = transport(LaneKind::ReliableOrdered, now, 64);
+            let key = sender
+                .send
+                .push(LANE, Bytes::from_static(b"sent"), now)
+                .unwrap();
+            for payload in flush_on(&mut sender, now, 64) {
+                recv_on(&mut peer, &TransportConfig::default(), now, &payload).unwrap();
+            }
+            if failure == Some(true) {
+                peer.send
+                    .push(LANE, Bytes::from_static(b"rejected"), now)
+                    .unwrap();
+            }
+            let mut packets = flush_on(&mut peer, now, 64).collect::<Vec<_>>();
+            assert_eq!(packets.len(), 1);
+            let mut payload = packets.pop().unwrap().to_vec();
+            if failure == Some(false) {
+                payload.push(0); // truncated fragment after a valid ACK header
+            }
+            let config = TransportConfig {
+                max_memory_usage: sender.memory_used(),
+                ..TransportConfig::default()
+            };
+            let result = recv_on(&mut sender, &config, now, &payload);
+            if let Some(out_of_memory) = failure {
+                if out_of_memory {
+                    assert!(matches!(
+                        result,
+                        Err(RecvError::Reassemble(ReassembleError::OutOfMemory { .. }))
+                    ));
+                } else {
+                    assert!(matches!(result, Err(RecvError::ReadFragment)));
+                }
+                assert!(!sender.peer_acks.is_acked(PacketSeq::new(0)));
+                assert_eq!(sender.num_unacked_packets(), 1);
+                assert_eq!(sender.stats().packet_acks_recv.0, 0);
+                assert_eq!(sender.stats().msg_acks_recv.0, 0);
+                assert!(
+                    sender.send.lanes[0].sent_msgs[&key.seq]
+                        .frags
+                        .iter()
+                        .all(Option::is_some)
+                );
+                assert_eq!(sender.recv.acks.drain().count(), 0);
+            } else {
+                result.unwrap();
+                assert!(sender.peer_acks.is_acked(PacketSeq::new(0)));
+                assert_eq!(sender.num_unacked_packets(), 0);
+                assert_eq!(sender.recv.acks.drain().collect::<Vec<_>>(), [key]);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_fragment_does_not_evict_or_allocate() {
+        let now = Instant::now();
+        let mut transport = transport(LaneKind::UnreliableUnordered, now, 64);
+        let config = TransportConfig::default();
+        let first = partial_packet(&transport, 0, 0, 3);
+        recv_on(&mut transport, &config, now, &first).unwrap();
+        let before = transport.memory_used();
+        let config = TransportConfig {
+            max_memory_usage: before,
+            ..config
+        };
+        let invalid = packet(
+            1,
+            [fragment(
+                1,
+                FragmentPosition::non_last(10u16).unwrap(),
+                b"bad",
+            )],
+        );
+        assert!(matches!(
+            recv_on(&mut transport, &config, now, &invalid),
+            Err(RecvError::Reassemble(
+                ReassembleError::InvalidPayloadLength { .. }
+            ))
+        ));
+        assert_eq!(transport.recv.lanes[0].num_reassembling_msgs(), 1);
+        assert_eq!(transport.memory_used(), before);
+        assert_eq!(
+            transport.recv.lanes[0]
+                .frags
+                .eviction_candidates(None)
+                .collect::<Vec<_>>(),
+            [(MessageSeq::new(0), now)]
+        );
+        assert!(!transport.peer_acks.is_acked(PacketSeq::new(1)));
+    }
+
+    #[test]
+    fn pressure_preserves_reliable_delivery_and_completed_retries() {
+        let now = Instant::now();
+        for kind in [LaneKind::ReliableOrdered, LaneKind::ReliableUnordered] {
+            let lanes = [
+                LaneKind::UnreliableUnordered,
+                LaneKind::UnreliableSequenced,
+                kind,
+            ];
+            let session = Session::new(now, 64);
+            let mut sender = Transport::new(&session, lanes, lanes, now).unwrap();
+            let mut receiver = Transport::new(&session, lanes, lanes, now).unwrap();
+            let reliable = LaneIndex::new(2);
+            let payload = vec![9; usize::from(sender.send.max_frag_len) * 4];
+            let key = sender
+                .send
+                .push(reliable, payload.clone().into(), now)
+                .unwrap();
+            let mut packets = flush_on(&mut sender, now, 64)
+                .collect::<Vec<_>>()
+                .into_iter();
+            let first = packets.next().unwrap(); // last fragment allocates the whole message
+            let config = TransportConfig::default();
+            recv_on(&mut receiver, &config, now, &first).unwrap();
+            let older = partial_packet(&receiver, 0, 0, 3);
+            recv_on(&mut receiver, &config, now, &older).unwrap();
+            let later = now + Duration::from_millis(1);
+            let newer = partial_packet(&receiver, 1, 0, 3);
+            recv_on(&mut receiver, &config, later, &newer).unwrap();
+            let config = TransportConfig {
+                max_memory_usage: receiver.memory_used() + 64,
+                ..config
+            };
+            let incoming = partial_packet(&receiver, 0, 1, 1);
+            recv_on(&mut receiver, &config, later, &incoming).unwrap();
+            assert!(receiver.memory_used() <= config.max_memory_usage);
+            assert_eq!(
+                receiver.recv.lanes[0]
+                    .frags
+                    .eviction_candidates(None)
+                    .map(|(seq, _)| seq)
+                    .collect::<Vec<_>>(),
+                [MessageSeq::new(1)]
+            );
+            assert_eq!(receiver.recv.lanes[1].num_reassembling_msgs(), 1);
+            assert_eq!(receiver.recv.lanes[2].num_reassembling_msgs(), 1);
+            for packet in packets {
+                recv_on(&mut receiver, &config, later, &packet).unwrap();
+            }
+            assert_eq!(
+                receiver
+                    .recv
+                    .msgs
+                    .drain()
+                    .map(|msg| (msg.lane, msg.payload))
+                    .collect::<Vec<_>>(),
+                [(reliable, payload)]
+            );
+            assert_eq!(receiver.recv.lanes[2].num_reassembling_msgs(), 0);
+            let memory_used = receiver.memory_used();
+            let retry_config = TransportConfig {
+                max_memory_usage: memory_used + 64,
+                ..config
+            };
+            // No ACKs have reached the sender. A single retried fragment must
+            // neither allocate a new reliable buffer nor evict unreliable
+            // state.
+            let retry_at = later + sender.rtt().pto();
+            let retry = flush_on(&mut sender, retry_at, 64).next().unwrap();
+            recv_on(&mut receiver, &retry_config, retry_at, &retry).unwrap();
+            assert_eq!(receiver.memory_used(), memory_used);
+            assert_eq!(receiver.recv.lanes[0].num_reassembling_msgs(), 1);
+            assert_eq!(receiver.recv.lanes[1].num_reassembling_msgs(), 1);
+            assert_eq!(receiver.recv.lanes[2].num_reassembling_msgs(), 0);
+            assert_eq!(receiver.recv.msgs.drain().count(), 0);
+            assert!(receiver.recv.error.is_none());
+            for ack in flush_on(&mut receiver, retry_at, 64) {
+                recv_on(&mut sender, &TransportConfig::default(), retry_at, &ack).unwrap();
+            }
+            assert!(
+                sender.send.lanes[2].sent_msgs[&key.seq]
+                    .frags
+                    .iter()
+                    .all(Option::is_none)
+            );
+        }
+    }
+
+    #[test]
+    fn memory_pressure_evicts_multiple_messages_in_age_order() {
+        let now = Instant::now();
+        let session = Session::new(now, 64);
+        let lanes = [LaneKind::UnreliableUnordered; 2];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        let config = TransportConfig::default();
+        for (lane, seq, at) in [
+            (1, 0, now),
+            (0, 0, now + Duration::from_millis(1)),
+            (1, 1, now + Duration::from_millis(2)),
+        ] {
+            let packet = partial_packet(&transport, lane, seq, 3);
+            recv_on(&mut transport, &config, at, &packet).unwrap();
+        }
+        let config = TransportConfig {
+            max_memory_usage: transport.memory_used() + 64,
+            ..config
+        };
+        let packet = partial_packet(&transport, 0, 1, 6);
+        recv_on(
+            &mut transport,
+            &config,
+            now + Duration::from_millis(2),
+            &packet,
+        )
+        .unwrap();
+        assert!(transport.memory_used() <= config.max_memory_usage);
+        for lane in &transport.recv.lanes {
+            assert_eq!(lane.num_reassembling_msgs(), 1);
+            assert_eq!(
+                lane.frags.eviction_candidates(None).next().unwrap().0,
+                MessageSeq::new(1)
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_protects_message_being_extended() {
+        let now = Instant::now();
+        let mut transport = transport(LaneKind::UnreliableUnordered, now, 64);
+        let config = TransportConfig::default();
+        let first = partial_packet(&transport, 0, 0, 0);
+        recv_on(&mut transport, &config, now, &first).unwrap();
+        let next = partial_packet(&transport, 0, 1, 3);
+        recv_on(
+            &mut transport,
+            &config,
+            now + Duration::from_millis(1),
+            &next,
+        )
+        .unwrap();
+        let config = TransportConfig {
+            max_memory_usage: transport.memory_used(),
+            ..config
+        };
+        let extend = partial_packet(&transport, 0, 0, 3);
+        recv_on(
+            &mut transport,
+            &config,
+            now + Duration::from_millis(2),
+            &extend,
+        )
+        .unwrap();
+        assert_eq!(transport.recv.lanes[0].num_reassembling_msgs(), 1);
+        assert_eq!(
+            transport.recv.lanes[0]
+                .frags
+                .eviction_candidates(None)
+                .collect::<Vec<_>>(),
+            [(MessageSeq::new(0), now)]
+        );
+        let used = transport.memory_used();
+        recv_on(&mut transport, &config, now, &first).unwrap();
+        assert_eq!(
+            transport.memory_used(),
+            used,
+            "the protected message kept its first fragment"
+        );
+        assert!(transport.memory_used() <= config.max_memory_usage);
+    }
+
+    #[test]
+    fn sequenced_delivery_discards_obsolete_partials_across_wraparound() {
+        let now = Instant::now();
+        let mut transport = transport(LaneKind::UnreliableSequenced, now, 64);
+        let config = TransportConfig::default();
+        let old = u16::MAX - 1;
+        transport.recv.lanes[0].state = LaneState::UnreliableSequenced {
+            pending: MessageSeq::new(old),
+        };
+        for seq in [old, 0] {
+            let packet = partial_packet(&transport, 0, seq, 0);
+            recv_on(&mut transport, &config, now, &packet).unwrap();
+        }
+        recv_on(
+            &mut transport,
+            &config,
+            now,
+            &packet(1, [fragment(u16::MAX, FragmentPosition::ZERO_LAST, b"new")]),
+        )
+        .unwrap();
+        assert_eq!(transport.recv.msgs.drain().count(), 1);
+        assert_eq!(
+            transport.recv.lanes[0]
+                .frags
+                .eviction_candidates(None)
+                .map(|(seq, _)| seq)
+                .collect::<Vec<_>>(),
+            [MessageSeq::new(0)]
+        );
+        let packet = partial_packet(&transport, 0, old, 0);
+        recv_on(&mut transport, &config, now, &packet).unwrap();
+        assert_eq!(transport.recv.lanes[0].num_reassembling_msgs(), 1);
     }
 
     #[test]
@@ -801,16 +1169,51 @@ mod tests {
                 .unwrap();
                 transport.recv.msgs.drain().for_each(drop);
                 let memory_used = transport.memory_used();
+                let retry_config = TransportConfig {
+                    max_memory_usage: memory_used + 64,
+                    ..config.clone()
+                };
                 let tracked = transport.recv.lanes[0].num_unordered_msgs();
 
                 // Replay only one fragment at a time, not a complete message.
                 for (packet_seq, frag) in [(1, first), (2, last)] {
-                    recv_on(&mut transport, &config, now, &packet(packet_seq, [frag])).unwrap();
+                    recv_on(
+                        &mut transport,
+                        &retry_config,
+                        now,
+                        &packet(packet_seq, [frag]),
+                    )
+                    .unwrap();
                     assert!(transport.peer_acks.is_acked(PacketSeq::new(packet_seq)));
                     assert_eq!(transport.recv.lanes[0].num_reassembling_msgs(), 0);
                     assert_eq!(transport.recv.lanes[0].num_unordered_msgs(), tracked);
                     assert_eq!(transport.memory_used(), memory_used);
                     assert_eq!(transport.recv.msgs.drain().count(), 0);
+                }
+                if seq == 1 {
+                    recv_on(
+                        &mut transport,
+                        &config,
+                        now,
+                        &packet(3, [fragment(0, FragmentPosition::ZERO_LAST, b"gap")]),
+                    )
+                    .unwrap();
+                    let delivered = transport
+                        .recv
+                        .msgs
+                        .drain()
+                        .map(|msg| msg.payload)
+                        .collect::<Vec<_>>();
+                    if kind == LaneKind::ReliableOrdered {
+                        assert_eq!(delivered.len(), 2);
+                        assert_eq!(delivered[0], b"gap");
+                        let mut expected = vec![1; usize::from(transport.send.max_frag_len)];
+                        expected.extend_from_slice(b"last");
+                        assert_eq!(delivered[1], expected);
+                    } else {
+                        assert_eq!(delivered, [b"gap".to_vec()]);
+                    }
+                    assert_eq!(transport.recv.lanes[0].num_unordered_msgs(), 0);
                 }
             }
         }
@@ -886,7 +1289,10 @@ mod tests {
             now,
             &packet(
                 2,
-                [fragment(0, FragmentPosition::last(1u16).unwrap(), b"last")],
+                [
+                    first,
+                    fragment(0, FragmentPosition::last(1u16).unwrap(), b"last"),
+                ],
             ),
         )
         .unwrap();

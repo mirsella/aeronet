@@ -147,6 +147,11 @@ pub struct TransportConfig {
     /// connections fail with an out-of-memory error, or you see
     /// [`Transport::memory_used`] is too high (you can use the [`visualizer`]
     /// to see real-time statistics).
+    ///
+    /// Before rejecting a fragment for insufficient memory, incomplete
+    /// unreliable messages are evicted oldest-first until enough space is
+    /// available. Reliable messages and the message being extended are
+    /// protected.
     pub max_memory_usage: usize,
     /// Maximum time to retain an incomplete message on an unreliable lane,
     /// measured from its first received fragment.
