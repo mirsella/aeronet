@@ -243,6 +243,13 @@ impl<T, const N: usize> SeqBuf<T, N> {
     #[inline]
     #[expect(clippy::missing_panics_doc, reason = "shouldn't panic")]
     pub fn insert(&mut self, key: u16, value: T) -> &mut T {
+        self.replace(key, value);
+        self.get_mut(key).expect("the value was just inserted")
+    }
+
+    // Unlike the public 0.21 API, return the overwritten value (including an
+    // empty slot's placeholder) so allocation accounting can retire it.
+    pub(crate) fn replace(&mut self, key: u16, value: T) -> T {
         let index = Self::index(key);
         let index_u = usize::from(index);
         let index_slot = self
@@ -266,8 +273,7 @@ impl<T, const N: usize> SeqBuf<T, N> {
             "`index_u` is valid into `indices`, and `indices` is of the same length as `data`, so \
              it should be a valid index into `data`",
         );
-        *data_slot = value;
-        data_slot
+        mem::replace(data_slot, value)
     }
 
     /// Removes a value from this buffer at the given key, replacing it with a

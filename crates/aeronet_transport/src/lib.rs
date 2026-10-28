@@ -25,6 +25,8 @@ pub mod size;
 pub mod visualizer;
 
 pub use aeronet_io as io;
+#[cfg(test)]
+use typesize::TypeSize;
 use {
     aeronet_io::{
         IoSystems, Session,
@@ -44,10 +46,11 @@ use {
     packet::{Acknowledge, FragmentHeader, MessageSeq, PacketHeader},
     recv::TransportRecv,
     rtt::RttEstimator,
+    sampling::PacketLossHistory,
     send::TransportSend,
     seq_buf::SeqBuf,
     size::MinSize,
-    typesize::{TypeSize, derive::TypeSize},
+    typesize::derive::TypeSize,
 };
 
 /// Sets up the transport layer functionality.
@@ -117,6 +120,8 @@ impl Plugin for AeronetTransportPlugin {
 pub struct Transport {
     // shared
     flushed_packets: SeqBuf<FlushedPacket, 1024>,
+    flushed_packets_size: usize,
+    packet_loss: PacketLossHistory,
     stats: MessageStats,
     peer_acks: Acknowledge,
     rtt: RttEstimator,
@@ -276,6 +281,8 @@ impl Transport {
         let max_frag_len = MinSize::MAX.min_of(max_frag_len);
         Ok(Self {
             flushed_packets: SeqBuf::new_from_fn(|_| FlushedPacket::new(now)),
+            flushed_packets_size: 0,
+            packet_loss: PacketLossHistory::new(now),
             stats: MessageStats::default(),
             peer_acks: Acknowledge::default(),
             rtt: RttEstimator::default(),
@@ -287,7 +294,10 @@ impl Transport {
     /// Gets the total stats gathered up to now.
     #[must_use]
     pub const fn stats(&self) -> MessageStats {
-        self.stats
+        MessageStats {
+            msgs_sent: self.send.msgs_sent,
+            ..self.stats
+        }
     }
 
     /// Gets access to the RTT estimator, allowing you to read the current RTT
@@ -306,11 +316,43 @@ impl Transport {
 
     /// Gets how many total bytes of memory this transport is using.
     ///
-    /// This call is potentially expensive. You should cache this where
-    /// possible.
+    /// This is a constant-time estimate, including reserved collection
+    /// capacity, fragment metadata and buffered payloads. It is not an exact
+    /// allocator measurement (shared outgoing byte allocations may be counted
+    /// more than once). Unlike upstream 0.22, unused capacity still counts
+    /// toward [`TransportConfig::max_memory_usage`].
     #[must_use]
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::missing_panics_doc,
+            reason = "only tests assert the allocation cache invariant"
+        )
+    )]
     pub fn memory_used(&self) -> usize {
-        self.get_size()
+        let used = size_of::<Self>()
+            + 1024 * (size_of::<u16>() + size_of::<FlushedPacket>())
+            + self.flushed_packets_size
+            + PacketLossHistory::EXTRA_SIZE
+            + self.send.extra_memory_used()
+            + self.recv.extra_memory_used();
+        #[cfg(test)]
+        assert_eq!(
+            used,
+            self.get_size(),
+            "cached allocations differ from the recursive size estimate"
+        );
+        used
+    }
+
+    fn record_flushed_packet(&mut self, seq: packet::PacketSeq, packet: FlushedPacket) {
+        let size = packet.extra_memory_used();
+        let replaced = self.flushed_packets.replace(seq.0.0, packet);
+        size::replace_cached(
+            &mut self.flushed_packets_size,
+            replaced.extra_memory_used(),
+            size,
+        );
     }
 }
 
@@ -368,7 +410,7 @@ pub struct MessageKey {
 pub struct MessageStats {
     /// Number of messages received into [`TransportRecv::msgs`].
     pub msgs_recv: Saturating<usize>,
-    /// Number of messages sent out from [`Transport::send`].
+    /// Number of messages successfully enqueued via [`TransportSend::push`].
     pub msgs_sent: Saturating<usize>,
     /// Number of packet acknowledgements received.
     pub packet_acks_recv: Saturating<usize>,
@@ -392,6 +434,10 @@ struct FlushedPacket {
 }
 
 impl FlushedPacket {
+    fn extra_memory_used(&self) -> usize {
+        self.frags.len() * size_of::<FragmentPath>()
+    }
+
     fn new(flushed_at: Instant) -> Self {
         Self {
             flushed_at,
@@ -433,7 +479,192 @@ fn check_memory_limit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        octs::{Bytes, Read},
+    };
+
+    fn checked_flush(transport: &mut Transport, now: Instant, mtu: usize) -> Vec<Bytes> {
+        let packets = send::flush_on(transport, now, mtu).collect();
+        assert_eq!(transport.memory_used(), transport.get_size());
+        packets
+    }
+
+    fn checked_recv(transport: &mut Transport, now: Instant, packet: &[u8]) {
+        recv::recv_on(transport, &TransportConfig::default(), now, packet).unwrap();
+        assert_eq!(transport.memory_used(), transport.get_size());
+    }
+
+    #[test]
+    fn cached_memory_and_stats_track_reordered_delivery_and_duplicate_acks() {
+        let now = Instant::now();
+        let mtu = 64;
+        let lane = LaneIndex::new(0);
+        for kind in [LaneKind::ReliableOrdered, LaneKind::ReliableUnordered] {
+            let session = Session::new(now, mtu);
+            let mut sender = Transport::new(&session, [kind], [kind], now).unwrap();
+            let mut receiver = Transport::new(&session, [kind], [kind], now).unwrap();
+            let payloads = [
+                Bytes::from(vec![7; 300]),
+                Bytes::new(),
+                Bytes::from_static(b"last"),
+            ];
+            for payload in &payloads {
+                sender.send.push(lane, payload.clone(), now).unwrap();
+                assert_eq!(sender.memory_used(), sender.get_size());
+            }
+            assert_eq!(sender.stats().msgs_sent.0, payloads.len());
+            for packet in checked_flush(&mut sender, now, mtu).iter().rev() {
+                checked_recv(&mut receiver, now, packet);
+                checked_recv(&mut receiver, now, packet);
+            }
+            assert_eq!(receiver.stats().msgs_recv.0, payloads.len());
+            let mut received = receiver
+                .recv
+                .msgs
+                .drain()
+                .map(|msg| msg.payload)
+                .collect::<Vec<_>>();
+            if kind == LaneKind::ReliableOrdered {
+                assert_eq!(
+                    received,
+                    payloads
+                        .iter()
+                        .map(|bytes| bytes.to_vec())
+                        .collect::<Vec<_>>()
+                );
+            }
+            received.sort();
+            let mut expected = payloads
+                .iter()
+                .map(|bytes| bytes.to_vec())
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(received, expected);
+            assert_eq!(receiver.memory_used(), receiver.get_size());
+
+            // Keep both original and retransmitted packet metadata alive, then
+            // acknowledge the same completed messages through different
+            // packets.
+            let later = now + sender.rtt.pto();
+            let retries = checked_flush(&mut sender, later, mtu);
+            for packet in checked_flush(&mut receiver, later, mtu) {
+                checked_recv(&mut sender, later, &packet);
+            }
+            assert_eq!(sender.stats().msg_acks_recv.0, payloads.len());
+            assert_eq!(sender.recv.acks.drain().count(), payloads.len());
+            for packet in retries {
+                checked_recv(&mut receiver, later, &packet);
+            }
+            assert_eq!(receiver.recv.msgs.drain().count(), 0);
+            for packet in checked_flush(&mut receiver, later, mtu) {
+                checked_recv(&mut sender, later, &packet);
+                checked_recv(&mut sender, later, &packet);
+            }
+            assert_eq!(sender.stats().msg_acks_recv.0, payloads.len());
+            assert_eq!(sender.recv.acks.drain().count(), 0);
+            assert_eq!(receiver.stats().msgs_recv.0, payloads.len());
+            checked_flush(&mut sender, later, mtu);
+            assert_eq!(sender.send.lanes()[0].num_queued_msgs(), 0);
+            assert_eq!(sender.memory_used(), sender.get_size());
+        }
+    }
+
+    #[test]
+    fn cached_memory_retires_unreliable_payloads_and_overwritten_packets() {
+        let now = Instant::now();
+        let session = Session::new(now, 64);
+        let lanes = [LaneKind::UnreliableUnordered];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        let initial = transport.memory_used();
+        let mut full_window_size = 0;
+        for index in 0..1100 {
+            transport
+                .send
+                .push(LaneIndex::new(0), Bytes::from_static(b"payload"), now)
+                .unwrap();
+            assert_eq!(transport.memory_used(), transport.get_size());
+            checked_flush(&mut transport, now, 64);
+            if index == 1023 {
+                full_window_size = transport.memory_used();
+            } else if index > 1023 {
+                assert_eq!(transport.memory_used(), full_window_size);
+            }
+        }
+        assert!(full_window_size > initial);
+        assert_eq!(transport.stats().msgs_sent.0, 1100);
+        checked_flush(&mut transport, now, 64);
+        assert!(transport.memory_used() < full_window_size);
+        assert_eq!(transport.send.lanes()[0].num_queued_msgs(), 0);
+    }
+
+    #[test]
+    fn cached_memory_survives_partial_drain_and_cross_lane_buffer_clear() {
+        let now = Instant::now();
+        let session = Session::new(now, 128);
+        let lanes = [
+            LaneKind::UnreliableUnordered,
+            LaneKind::UnreliableSequenced,
+            LaneKind::ReliableUnordered,
+            LaneKind::ReliableOrdered,
+        ];
+        let mut sender = Transport::new(&session, lanes, lanes, now).unwrap();
+        let mut receiver = Transport::new(&session, lanes, lanes, now).unwrap();
+        for lane in 0..4 {
+            sender
+                .send
+                .push(LaneIndex::new(lane), Bytes::from(vec![1; 200]), now)
+                .unwrap();
+        }
+        for packet in checked_flush(&mut sender, now, 128) {
+            checked_recv(&mut receiver, now, &packet);
+        }
+        assert_eq!(
+            receiver.recv.msgs.drain().next().unwrap().payload.len(),
+            200
+        );
+        assert_eq!(receiver.memory_used(), receiver.get_size());
+        // Dropping a partially consumed drain retires all remaining payloads.
+        assert_eq!(receiver.recv.msgs.drain().count(), 0);
+        for lane in 0..4 {
+            sender
+                .send
+                .push(LaneIndex::new(lane), Bytes::from(vec![2; 200]), now)
+                .unwrap();
+        }
+        for packet in checked_flush(&mut sender, now, 128) {
+            checked_recv(&mut receiver, now, &packet);
+        }
+        let before = receiver.memory_used();
+        let mut app = App::new();
+        app.add_systems(PreUpdate, recv::clear_buffers);
+        let entity = app.world_mut().spawn(receiver).id();
+        app.update();
+        let receiver = app.world().get::<Transport>(entity).unwrap();
+        assert!(receiver.memory_used() < before);
+        assert_eq!(receiver.memory_used(), receiver.get_size());
+        assert_eq!(receiver.stats().msgs_recv.0, 8);
+    }
+
+    #[test]
+    fn extreme_rtt_retries_without_overflow() {
+        let now = Instant::now();
+        let session = Session::new(now, 64);
+        let lanes = [LaneKind::ReliableOrdered];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        transport.rtt = RttEstimator::new(Duration::MAX);
+        transport
+            .send
+            .push(LaneIndex::new(0), Bytes::from_static(b"payload"), now)
+            .unwrap();
+        for _ in 0..2 {
+            let mut packet = checked_flush(&mut transport, now, 64).pop().unwrap();
+            packet.read::<PacketHeader>().unwrap();
+            packet.read::<packet::Fragment>().unwrap();
+        }
+        assert_eq!(transport.stats().msgs_sent.0, 1);
+        assert_eq!(transport.memory_used(), transport.get_size());
+    }
 
     #[test]
     fn new_requires_space_for_fragment_payload() {

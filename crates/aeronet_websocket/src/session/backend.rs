@@ -248,7 +248,15 @@ pub mod native {
                 Message::Close(Some(frame)) => {
                     return Err(DisconnectReason::by_peer(frame.reason.to_string()));
                 }
-                msg => msg.into_data(),
+                Message::Ping(_) | Message::Pong(_) => {
+                    // Control frames are not Aeronet packets.
+                    return Ok(());
+                }
+                Message::Binary(msg) => msg,
+                msg @ Message::Text(_) => msg.into_data(),
+                Message::Frame(_) => {
+                    unreachable!("should not receive `Message::Frame`s from reading message");
+                }
             };
             let now = Instant::now();
 
@@ -283,6 +291,25 @@ pub mod native {
                 .await
                 .map_err(SessionError::Connection)?;
             Ok(())
+        }
+    }
+
+    #[cfg(all(test, feature = "server"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn control_frames_do_not_reach_packet_receiver() {
+            type Backend = SessionBackend<tokio::net::TcpStream>;
+            let (tx, mut rx) = mpsc::unbounded();
+            Backend::recv(&tx, Message::Ping(Bytes::from_static(b"ping"))).unwrap();
+            Backend::recv(&tx, Message::Pong(Bytes::from_static(b"pong"))).unwrap();
+            assert!(rx.try_next().is_err());
+            Backend::recv(&tx, Message::Binary(Bytes::from_static(b"packet"))).unwrap();
+            assert_eq!(rx.try_next().unwrap().unwrap().payload, b"packet"[..]);
+            Backend::recv(&tx, Message::Text("text packet".into())).unwrap();
+            assert_eq!(rx.try_next().unwrap().unwrap().payload, b"text packet"[..]);
+            assert!(Backend::recv(&tx, Message::Close(None)).is_err());
         }
     }
 }

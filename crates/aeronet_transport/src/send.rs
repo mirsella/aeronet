@@ -11,7 +11,7 @@ use {
             PacketSeq,
         },
         rtt::RttEstimator,
-        size::MinSize,
+        size::{MinSize, replace_cached},
     },
     aeronet_io::{
         Session,
@@ -19,21 +19,20 @@ use {
     },
     alloc::{boxed::Box, vec::Vec},
     bevy_ecs::prelude::*,
-    bevy_platform::{
-        collections::{HashMap, hash_map::Entry},
-        time::Instant,
-    },
+    bevy_platform::{collections::HashMap, time::Instant},
     bevy_time::{Real, Time},
-    core::iter,
+    core::{iter, num::Saturating},
     derive_more::{Display, Error, From},
     log::trace,
     octs::{Bytes, EncodeLen, Write},
-    typesize::derive::TypeSize,
+    typesize::{TypeSize, derive::TypeSize},
 };
 
 /// Allows buffering up messages to be sent on a [`Transport`].
 #[derive(Debug, TypeSize)]
 pub struct TransportSend {
+    pub(crate) msgs_sent: Saturating<usize>,
+    pub(crate) lanes_size: usize,
     pub(crate) max_frag_len: MinSize,
     pub(crate) lanes: Box<[SendLane]>,
     bytes_bucket: TokenBucket,
@@ -44,6 +43,7 @@ pub struct TransportSend {
 /// State of a lane used for sending outgoing messages on a [`Transport`].
 #[derive(Debug, Clone, TypeSize)]
 pub struct SendLane {
+    pub(crate) sent_msgs_size: usize,
     kind: LaneKind,
     #[typesize(with = crate::size::of_map)]
     pub(crate) sent_msgs: HashMap<MessageSeq, SentMessage>,
@@ -53,6 +53,7 @@ pub struct SendLane {
 #[derive(Debug, Clone, TypeSize)]
 pub(crate) struct SentMessage {
     pub(crate) frags: Box<[Option<SentFragment>]>,
+    pub(crate) acked: bool,
 }
 
 #[derive(Debug, Clone, TypeSize)]
@@ -72,11 +73,14 @@ impl TransportSend {
         lanes: impl IntoIterator<Item = impl Into<LaneKind>>,
     ) -> Self {
         Self {
+            msgs_sent: Saturating(0),
+            lanes_size: 0,
             max_frag_len,
             lanes: lanes
                 .into_iter()
                 .map(Into::into)
                 .map(|kind| SendLane {
+                    sent_msgs_size: 0,
                     kind,
                     sent_msgs: HashMap::default(),
                     next_msg_seq: MessageSeq::default(),
@@ -86,6 +90,10 @@ impl TransportSend {
             next_packet_seq: PacketSeq::default(),
             error: None,
         }
+    }
+
+    pub(crate) fn extra_memory_used(&self) -> usize {
+        self.lanes.len() * size_of::<SendLane>() + self.lanes_size
     }
 
     /// Gets access to the state of the sender-side lanes.
@@ -172,10 +180,11 @@ impl TransportSend {
     ) -> Result<MessageKey, TransportSendError> {
         let result = (|| {
             let lane = &mut self.lanes[usize::from(lane_index.0)];
+            let before = lane.extra_memory_used();
             let msg_seq = lane.next_msg_seq;
-            let Entry::Vacant(entry) = lane.sent_msgs.entry(msg_seq) else {
+            if lane.sent_msgs.contains_key(&msg_seq) {
                 return Err(TransportSendError::TooManyMessages);
-            };
+            }
 
             let frags = frag::split(self.max_frag_len, msg)?
                 .map(|(position, payload)| SentFragment {
@@ -215,11 +224,16 @@ impl TransportSend {
                 frags
             };
 
-            entry.insert(SentMessage {
+            let msg = SentMessage {
                 frags: frags.into_iter().map(Some).collect(),
-            });
+                acked: false,
+            };
+            replace_cached(&mut lane.sent_msgs_size, 0, msg.extra_size());
+            lane.sent_msgs.insert(msg_seq, msg);
+            replace_cached(&mut self.lanes_size, before, lane.extra_memory_used());
 
             lane.next_msg_seq += MessageSeq::new(1);
+            self.msgs_sent += 1;
             Ok(MessageKey {
                 lane: lane_index,
                 seq: msg_seq,
@@ -245,6 +259,11 @@ pub enum TransportSendError {
 }
 
 impl SendLane {
+    pub(crate) fn extra_memory_used(&self) -> usize {
+        self.sent_msgs.capacity() * (size_of::<MessageSeq>() + size_of::<SentMessage>())
+            + self.sent_msgs_size
+    }
+
     /// Gets what kind of lane this state represents.
     #[must_use]
     pub const fn kind(&self) -> LaneKind {
@@ -325,7 +344,9 @@ pub fn flush_on(
         .lanes
         .iter_mut()
         .enumerate()
-        .flat_map(|(lane_index, lane)| frag_paths_in_lane(now, lane_index, lane))
+        .flat_map(|(lane_index, lane)| {
+            frag_paths_in_lane(now, lane_index, lane, &mut transport.send.lanes_size)
+        })
         .collect::<Vec<_>>();
 
     // sort by time sent, oldest to newest
@@ -342,10 +363,11 @@ pub fn flush_on(
 
         // make a buffer for the packet
         // note: we may want to preallocate some memory for this,
-        // and have it be user-configurable, but I don't want to overcomplicate it
-        // also, we don't preallocate `mtu` bytes, because that might be a big length
-        // e.g. Steamworks already fragments messages, so we don't fragment messages
-        // ourselves, leading to very large `mtu`s (~512KiB)
+        // and have it be user-configurable, but I don't want to overcomplicate
+        // it also, we don't preallocate `mtu` bytes, because that might
+        // be a big length e.g. Steamworks already fragments messages,
+        // so we don't fragment messages ourselves, leading to very
+        // large `mtu`s (~512KiB)
         let mut packet = Vec::<u8>::new();
 
         // we can't put more than either `mtu` or `bytes_left`
@@ -374,6 +396,7 @@ pub fn flush_on(
                 now,
                 &transport.rtt,
                 &mut transport.send.lanes,
+                &mut transport.send.lanes_size,
                 &mut bytes_left,
                 &mut packet,
                 path,
@@ -398,13 +421,14 @@ pub fn flush_on(
             packet_seq.0.0,
             packet_frags.len()
         );
-        transport.flushed_packets.insert(
-            packet_seq.0.0,
+        transport.record_flushed_packet(
+            packet_seq,
             FlushedPacket {
                 flushed_at: now,
                 frags: packet_frags.into_boxed_slice(),
             },
         );
+        transport.packet_loss.record(packet_seq, now);
 
         transport.send.next_packet_seq += PacketSeq::new(1);
         sent_packet_yet = true;
@@ -412,19 +436,27 @@ pub fn flush_on(
     })
 }
 
-fn frag_paths_in_lane(
+fn frag_paths_in_lane<'a>(
     now: Instant,
     lane_index: usize,
-    lane: &mut SendLane,
-) -> impl Iterator<Item = (FragmentPath, Instant)> + '_ {
+    lane: &'a mut SendLane,
+    lanes_size: &mut usize,
+) -> impl Iterator<Item = (FragmentPath, Instant)> + use<'a> {
     let lane_index = LaneIndex(
         MinSize::try_from(lane_index)
             .expect("we should not have more lanes than can fit in `MinSize`"),
     );
 
     // drop any messages which have no frags to send
-    lane.sent_msgs
-        .retain(|_, msg| msg.frags.iter().any(Option::is_some));
+    let before = lane.extra_memory_used();
+    lane.sent_msgs.retain(|_, msg| {
+        let keep = msg.frags.iter().any(Option::is_some);
+        if !keep {
+            replace_cached(&mut lane.sent_msgs_size, msg.extra_size(), 0);
+        }
+        keep
+    });
+    replace_cached(lanes_size, before, lane.extra_memory_used());
 
     // grab the frag paths from this lane's messages
     lane.sent_msgs.iter().flat_map(move |(msg_seq, msg)| {
@@ -455,6 +487,7 @@ fn write_frag_at_path(
     now: Instant,
     rtt: &RttEstimator,
     lanes: &mut [SendLane],
+    lanes_size: &mut usize,
     bytes_left: &mut impl Limit,
     packet: &mut Vec<u8>,
     path: FragmentPath,
@@ -496,12 +529,17 @@ fn write_frag_at_path(
             // drop the frag
             // if we've dropped all frags of this message, then
             // on the next `flush`, we'll drop the message
+            let size = sent_frag.extra_size();
+            replace_cached(&mut lane.sent_msgs_size, size, 0);
+            replace_cached(lanes_size, size, 0);
             *frag_slot = None;
         }
         LaneReliability::Reliable => {
             // don't drop the frag, just attempt to resend it later
             // it'll be dropped when the peer acks it
-            sent_frag.next_flush_at = now + rtt.pto();
+            // An unrepresentable deadline cannot be waited for. Retry on the
+            // next flush rather than panicking on an extreme RTT estimate.
+            sent_frag.next_flush_at = now.checked_add(rtt.pto()).unwrap_or(now);
         }
     }
 
@@ -522,10 +560,32 @@ mod tests {
         aeronet_io::Session,
         bevy_platform::time::Instant,
         octs::{Bytes, Read},
+        typesize::TypeSize,
     };
 
     const LANES: [LaneKind; 1] = [LaneKind::ReliableOrdered];
     const LANE: LaneIndex = LaneIndex::new(0);
+
+    #[test]
+    fn failed_enqueue_is_not_counted() {
+        let now = Instant::now();
+        let session = Session::new(now, 64);
+        let lanes = [LaneKind::ReliableOrdered];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        let key = transport
+            .send
+            .push(LANE, Bytes::from_static(b"payload"), now)
+            .unwrap();
+        // Reuse a still-live sequence to exercise the bounded queue error
+        // without allocating an oversized payload.
+        transport.send.lanes[0].next_msg_seq = key.seq;
+        assert!(matches!(
+            transport.send.push(LANE, Bytes::new(), now),
+            Err(super::TransportSendError::TooManyMessages)
+        ));
+        assert_eq!(transport.stats().msgs_sent.0, 1);
+        assert_eq!(transport.memory_used(), transport.get_size());
+    }
 
     #[test]
     fn send_some_data() {

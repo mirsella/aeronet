@@ -142,3 +142,12 @@ pub(crate) fn of_map<K: TypeSize, V: TypeSize>(v: &HashMap<K, V>) -> usize {
         .saturating_mul(size_of::<K>().saturating_add(size_of::<V>()));
     element_size.saturating_add(free_size)
 }
+
+/// Replace one contribution to an allocation cache. A mismatch is a bug, not
+/// an excuse to silently saturate and weaken the memory limit.
+pub(crate) fn replace_cached(total: &mut usize, before: usize, after: usize) {
+    *total = total
+        .checked_sub(before)
+        .and_then(|remaining| remaining.checked_add(after))
+        .expect("allocation cache must equal the sum of its live contributions");
+}

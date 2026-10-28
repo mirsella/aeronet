@@ -11,7 +11,7 @@
 use {
     crate::{
         packet::{FragmentPayload, FragmentPosition, MessageSeq},
-        size::MinSize,
+        size::{MinSize, replace_cached},
     },
     alloc::vec::Vec,
     bevy_platform::{collections::HashMap, time::Instant},
@@ -108,10 +108,23 @@ pub struct MessageTooBig {
 
 /// Receives fragments created by [`split`] and reassembles them into full
 /// messages.
-#[derive(Default, Clone, TypeSize)]
+#[derive(Default, TypeSize)]
 pub struct FragmentReceiver {
     #[typesize(with = crate::size::of_map)]
     msgs: HashMap<MessageSeq, MessageBuf>,
+    buffered_size: usize,
+}
+
+impl Clone for FragmentReceiver {
+    fn clone(&self) -> Self {
+        let msgs = self.msgs.clone();
+        // Cloning Vec/BitVec may shrink their reserved capacity.
+        let buffered_size = msgs.values().map(MessageBuf::extra_memory_used).sum();
+        Self {
+            msgs,
+            buffered_size,
+        }
+    }
 }
 
 /// Received an invalid fragment when reassembling fragments into a message.
@@ -199,6 +212,12 @@ struct MessageBuf {
     payload: Vec<u8>,
 }
 
+impl MessageBuf {
+    fn extra_memory_used(&self) -> usize {
+        self.payload.capacity() + self.frag_indices_recv.capacity() / 8
+    }
+}
+
 /// Validated fragment layout. Its message must not be modified or evicted
 /// between preparation and insertion.
 #[derive(Debug)]
@@ -218,13 +237,25 @@ impl fmt::Debug for FragmentReceiver {
         let seqs = self.msgs.keys().collect::<Vec<_>>();
         f.debug_struct("FragmentReceiver")
             .field("msgs", &seqs)
+            .field("buffered_size", &self.buffered_size)
             .finish()
     }
 }
 
 impl FragmentReceiver {
+    pub(crate) fn extra_memory_used(&self) -> usize {
+        self.msgs.capacity() * (size_of::<MessageSeq>() + size_of::<MessageBuf>())
+            + self.buffered_size
+    }
+
     pub(crate) fn discard_before(&mut self, pending: MessageSeq) {
-        self.msgs.retain(|seq, _| *seq >= pending);
+        self.msgs.retain(|seq, buf| {
+            let keep = *seq >= pending;
+            if !keep {
+                replace_cached(&mut self.buffered_size, buf.extra_memory_used(), 0);
+            }
+            keep
+        });
     }
 
     pub(crate) fn eviction_candidates(
@@ -240,7 +271,9 @@ impl FragmentReceiver {
     }
 
     pub(crate) fn discard(&mut self, seq: MessageSeq) {
-        self.msgs.remove(&seq);
+        if let Some(buf) = self.msgs.remove(&seq) {
+            replace_cached(&mut self.buffered_size, buf.extra_memory_used(), 0);
+        }
     }
 
     /// Gets the number of messages which are currently being reassembled, but
@@ -259,8 +292,13 @@ impl FragmentReceiver {
 
     pub(crate) fn expire(&mut self, now: Instant, timeout: Duration) {
         self.msgs.retain(|_, buf| {
-            buf.first_recv_at
-                .is_none_or(|first| now.saturating_duration_since(first) < timeout)
+            let keep = buf
+                .first_recv_at
+                .is_none_or(|first| now.saturating_duration_since(first) < timeout);
+            if !keep {
+                replace_cached(&mut self.buffered_size, buf.extra_memory_used(), 0);
+            }
+            keep
         });
     }
 
@@ -431,6 +469,7 @@ impl FragmentReceiver {
             frag_indices_recv: BitVec::new(),
             payload: Vec::new(),
         });
+        let before = buf.extra_memory_used();
         buf.payload.resize(buf.payload.len().max(frag.end), 0);
 
         let grow_len = frag.num_indices.saturating_sub(buf.frag_indices_recv.len());
@@ -459,11 +498,13 @@ impl FragmentReceiver {
                 "we already have a mut ref to the buffer at this key, so we should be able to \
                  remove and take ownership of it",
             );
+            replace_cached(&mut self.buffered_size, before, 0);
             Some(buf.payload)
         } else {
             // this happens separately from the other buffer meta update
             // so that the `if` condition above works properly
             buf.num_frags_recv += 1;
+            replace_cached(&mut self.buffered_size, before, buf.extra_memory_used());
             None
         }
     }

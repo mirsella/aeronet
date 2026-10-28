@@ -1,5 +1,12 @@
 Version changelog.
 
+# Mighty Minions 0.21 backports
+
+- Backport WebTransport handshake cancellation from upstream [#110](https://github.com/aecsocket/aeronet/pull/110), including explicit browser-side closure when the frontend disappears.
+- Backport WebSocket control-frame filtering, fractional rate-limit refill, overflow-safe RTT calculations, message counters and packet-loss history from [#109](https://github.com/aecsocket/aeronet/pull/109).
+- Adapt cached memory accounting from [#113](https://github.com/aecsocket/aeronet/pull/113). `Transport::memory_used()` runs in constant time and still counts reserved capacity and metadata toward the memory limit, rather than only logical payload lengths.
+- Preserve the fork's reassembly expiry, completed-message replay filtering, terminal receive errors, pending-ACK admission credit and native WebSocket connection cancellation. Keep Bevy 0.19, Replicon 0.44 and the 0.21 public APIs and packet format.
+
 # 0.22.0
 
 - Update to `bevy_replicon` 0.42.1
