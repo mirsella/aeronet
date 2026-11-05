@@ -10,6 +10,7 @@ use {
         net::SocketAddr,
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     },
     futures::{
         FutureExt, SinkExt, StreamExt,
@@ -19,6 +20,7 @@ use {
     tokio::{
         io::{AsyncRead, AsyncWrite, ReadBuf},
         net::{TcpListener, TcpStream},
+        time::{Instant, timeout_at},
     },
     tokio_rustls::TlsAcceptor,
     tokio_tungstenite::tungstenite::{
@@ -27,6 +29,8 @@ use {
     },
     tracing::{Instrument, debug, debug_span},
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn start(
     config: ServerConfig,
@@ -91,20 +95,25 @@ async fn accept_session(
     mut tx_connecting: mpsc::Sender<ToConnecting>,
     handshake_handler: Option<HandshakeHandler>,
 ) -> Result<(), DisconnectReason> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let (tx_session_entity, rx_session_entity) = oneshot::channel::<Entity>();
     let (tx_dc_reason, rx_dc_reason) = oneshot::channel::<DisconnectReason>();
     let (tx_next, rx_next) = oneshot::channel::<ToConnected>();
-    tx_connecting
-        .send(ToConnecting {
+    timeout_at(
+        deadline,
+        tx_connecting.send(ToConnecting {
             peer_addr,
             tx_session_entity,
             rx_dc_reason,
             rx_next,
-        })
+        }),
+    )
+    .await
+    .map_err(|_| ServerError::HandshakeTimeout)?
+    .map_err(|_| SessionError::FrontendClosed)?;
+    let session = timeout_at(deadline, rx_session_entity)
         .await
-        .map_err(|_| SessionError::FrontendClosed)?;
-    let session = rx_session_entity
-        .await
+        .map_err(|_| ServerError::HandshakeTimeout)?
         .map_err(|_| SessionError::FrontendClosed)?;
 
     let Err(dc_reason) = handle_session(
@@ -114,6 +123,7 @@ async fn accept_session(
         tls_acceptor,
         tx_next,
         handshake_handler,
+        deadline,
     )
     .instrument(debug_span!("session", %session))
     .await;
@@ -126,34 +136,48 @@ async fn handle_session(
     peer_addr: SocketAddr,
     socket_config: WebSocketConfig,
     tls_acceptor: Option<TlsAcceptor>,
-    tx_next: oneshot::Sender<ToConnected>,
+    mut tx_next: oneshot::Sender<ToConnected>,
     handshake_handler: Option<HandshakeHandler>,
+    deadline: Instant,
 ) -> Result<Never, DisconnectReason> {
     debug!("Performing session handshake");
 
-    let stream = if let Some(tls_acceptor) = tls_acceptor {
-        tls_acceptor
-            .accept(stream)
-            .await
-            .map(MaybeTlsStream::Rustls)
-            .map_err(ServerError::TlsHandshake)?
-    } else {
-        MaybeTlsStream::Plain(stream)
+    let handshake = async {
+        let stream = if let Some(tls_acceptor) = tls_acceptor {
+            tls_acceptor
+                .accept(stream)
+                .await
+                .map(MaybeTlsStream::Rustls)
+                .map_err(ServerError::TlsHandshake)?
+        } else {
+            MaybeTlsStream::Plain(stream)
+        };
+        let stream = tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            #[expect(
+                clippy::result_large_err,
+                reason = "this `Result` is what `tokio_tungstenite` asks for"
+            )]
+            |req: &Request, resp: Response| match &handshake_handler {
+                Some(h) => h.handle(req, resp),
+                None => Ok(resp),
+            },
+            Some(socket_config),
+        )
+        .await
+        .map_err(ServerError::AcceptClient)?;
+        Ok::<_, ServerError>(stream)
     };
-    let stream = tokio_tungstenite::accept_hdr_async_with_config(
-        stream,
-        #[expect(
-            clippy::result_large_err,
-            reason = "this `Result` is what `tokio_tungstenite` asks for"
-        )]
-        |req: &Request, resp: Response| match &handshake_handler {
-            Some(h) => h.handle(req, resp),
-            None => Ok(resp),
-        },
-        Some(socket_config),
-    )
-    .await
-    .map_err(ServerError::AcceptClient)?;
+    futures::pin_mut!(handshake);
+    // Dropping this future also drops the TCP stream, including partial
+    // TLS/HTTP upgrades. A frontend evicted before connection must not
+    // leave a backend task.
+    let stream = futures::select! {
+        () = tx_next.cancellation().fuse() => return Err(SessionError::FrontendClosed.into()),
+        result = timeout_at(deadline, handshake).fuse() => {
+            result.map_err(|_| ServerError::HandshakeTimeout)??
+        }
+    };
 
     let (frontend, backend) = crate::session::backend::native::split(stream);
     let connected = ToConnected {
@@ -217,5 +241,134 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<S> {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Self::Rustls(s) => Pin::new(s).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        tokio::io::{AsyncReadExt, AsyncWriteExt},
+    };
+
+    #[test]
+    fn pending_upgrade_closes_with_frontend_or_deadline() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for frontend_closes in [true, false] {
+                let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (stream, address) = listener.accept().await.unwrap();
+                let (tx, rx) = oneshot::channel();
+                // A syntactically incomplete request never reaches the header
+                // callback.
+                peer.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+                    .await
+                    .unwrap();
+                let deadline = Instant::now()
+                    + if frontend_closes {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(50)
+                    };
+                let task = tokio::spawn(handle_session(
+                    stream,
+                    address,
+                    WebSocketConfig::default(),
+                    None,
+                    tx,
+                    None,
+                    deadline,
+                ));
+                let mut frontend = Some(rx);
+                if frontend_closes {
+                    drop(frontend.take());
+                }
+                let error = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                drop(frontend);
+                let DisconnectReason::ByError(error) = error else {
+                    panic!("unexpected disconnect reason");
+                };
+                if frontend_closes {
+                    assert!(matches!(
+                        error.downcast_ref::<SessionError>(),
+                        Some(SessionError::FrontendClosed)
+                    ));
+                } else {
+                    assert!(matches!(
+                        error.downcast_ref::<ServerError>(),
+                        Some(ServerError::HandshakeTimeout)
+                    ));
+                }
+                let mut byte = [0];
+                let closed = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .unwrap();
+                match closed {
+                    Ok(0) => {}
+                    // The canceled frontend can drop before HTTP bytes are read.
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("pending socket was not closed: {other:?}"),
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "aws-lc-rs")]
+    #[test]
+    fn pending_tls_closes_when_frontend_disappears() {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, address) = listener.accept().await.unwrap();
+            let config = ServerConfig::builder()
+                .with_bind_address(address)
+                .with_identity(super::super::Identity::self_signed(["localhost"]).unwrap());
+            let (tx, rx) = oneshot::channel();
+            let task = tokio::spawn(handle_session(
+                stream,
+                address,
+                config.socket,
+                config.tls.map(TlsAcceptor::from),
+                tx,
+                None,
+                Instant::now() + HANDSHAKE_TIMEOUT,
+            ));
+            drop(rx);
+            let error = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            let DisconnectReason::ByError(error) = error else {
+                panic!("unexpected disconnect reason");
+            };
+            assert!(matches!(
+                error.downcast_ref::<SessionError>(),
+                Some(SessionError::FrontendClosed)
+            ));
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        });
     }
 }

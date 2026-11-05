@@ -133,6 +133,9 @@ pub enum ServerError {
     /// Failed to accept the client due to a WebSocket protocol error.
     #[display("failed to accept client")]
     AcceptClient(tungstenite::Error),
+    /// The frontend, TLS, and HTTP upgrade did not complete within ten seconds.
+    #[display("session handshake timed out")]
+    HandshakeTimeout,
 }
 
 #[derive(Debug, Component)]

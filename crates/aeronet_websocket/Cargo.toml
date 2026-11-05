@@ -91,7 +91,7 @@ document-features = ["dep:document-features"]
 ## [`rcgen`]: https://docs.rs/rcgen
 self-signed = ["dep:rcgen"]
 ## Enables the `server` module.
-server = ["dep:tokio-rustls", "tokio-tungstenite/handshake", "tokio/net"]
+server = ["dep:tokio-rustls", "tokio-tungstenite/handshake", "tokio/net", "tokio/time"]
 
 [lints]
 workspace = true
