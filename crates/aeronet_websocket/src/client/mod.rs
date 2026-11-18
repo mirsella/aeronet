@@ -171,6 +171,9 @@ struct Connecting {
 #[derive(Debug, Component)]
 struct Connected {
     rx_dc_reason: oneshot::Receiver<DisconnectReason>,
+    /// Reason received this update, held for one update so the frames the peer
+    /// sent before closing reach [`Session::recv`] before the session despawns.
+    closing: Option<DisconnectReason>,
 }
 
 #[derive(Debug)]
@@ -203,7 +206,10 @@ fn poll_connecting(
                 tx_packet_f2b: next.frontend.tx_packet_f2b,
                 tx_user_dc: Some(next.frontend.tx_user_dc),
             },
-            Connected { rx_dc_reason },
+            Connected {
+                rx_dc_reason,
+                closing: None,
+            },
             Session::new(Instant::now(), MTU),
             #[cfg(not(target_family = "wasm"))]
             aeronet_io::connection::LocalAddr(next.local_addr),
@@ -217,8 +223,14 @@ fn poll_connected(
     mut commands: Commands,
     mut clients: Query<(Entity, &mut Connected), With<WebSocketClient>>,
 ) {
-    for (client, mut client_io) in &mut clients {
-        try_disconnect(&mut commands, client, &mut client_io.rx_dc_reason);
+    for (entity, mut client) in &mut clients {
+        if let Some(reason) = client.closing.take() {
+            commands.trigger(Disconnected { entity, reason });
+        } else {
+            // The backend queues every frame before reporting the close, so
+            // `session::poll` drains them into `Session::recv` this update.
+            client.closing = disconnect_reason(&mut client.rx_dc_reason);
+        }
     }
 }
 
@@ -227,13 +239,16 @@ fn try_disconnect(
     entity: Entity,
     rx_dc_reason: &mut oneshot::Receiver<DisconnectReason>,
 ) -> bool {
-    let dc_reason = match rx_dc_reason.try_recv() {
-        Ok(None) => None,
-        Ok(Some(disconnected)) => Some(disconnected),
-        Err(_) => Some(SessionError::BackendClosed.into()),
-    };
-    dc_reason.is_some_and(|reason| {
+    disconnect_reason(rx_dc_reason).is_some_and(|reason| {
         commands.trigger(Disconnected { entity, reason });
         true
     })
+}
+
+fn disconnect_reason(
+    rx_dc_reason: &mut oneshot::Receiver<DisconnectReason>,
+) -> Option<DisconnectReason> {
+    rx_dc_reason
+        .try_recv()
+        .unwrap_or_else(|_canceled| Some(SessionError::BackendClosed.into()))
 }
