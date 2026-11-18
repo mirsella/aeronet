@@ -190,11 +190,13 @@ fn poll_connecting(
     mut clients: Query<(Entity, &mut Connecting), With<WebSocketClient>>,
 ) {
     for (entity, mut client) in &mut clients {
-        if try_disconnect(&mut commands, entity, &mut client.rx_dc_reason) {
-            continue;
-        }
-
+        // Promote before looking for a close: frames that arrived with the
+        // handshake are only delivered through the connected session, which
+        // then reports the close it still finds pending.
         let Ok(Some(next)) = client.rx_next.try_recv() else {
+            if let Some(reason) = disconnect_reason(&mut client.rx_dc_reason) {
+                commands.trigger(Disconnected { entity, reason });
+            }
             continue;
         };
 
@@ -232,17 +234,6 @@ fn poll_connected(
             client.closing = disconnect_reason(&mut client.rx_dc_reason);
         }
     }
-}
-
-fn try_disconnect(
-    commands: &mut Commands,
-    entity: Entity,
-    rx_dc_reason: &mut oneshot::Receiver<DisconnectReason>,
-) -> bool {
-    disconnect_reason(rx_dc_reason).is_some_and(|reason| {
-        commands.trigger(Disconnected { entity, reason });
-        true
-    })
 }
 
 fn disconnect_reason(

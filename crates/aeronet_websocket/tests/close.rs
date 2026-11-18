@@ -25,6 +25,20 @@ struct Seen(Vec<&'static str>);
 /// still have that frame delivered before the session disconnects.
 #[test]
 fn frames_sent_before_a_close_are_received_before_the_disconnect() {
+    deliver_last_words(true);
+}
+
+/// The same holds when the handshake, the frame and the close all land before
+/// the client's first update sees the connection.
+#[test]
+fn frames_sent_before_the_client_saw_the_connection_are_received_before_the_disconnect() {
+    deliver_last_words(false);
+}
+
+/// Has a peer send a frame then close, either once the client holds a session
+/// or straight after the handshake, and checks the client sees the frame
+/// before the disconnect.
+fn deliver_last_words(after_session: bool) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -80,8 +94,10 @@ fn frames_sent_before_a_close_are_received_before_the_disconnect() {
     )
     .apply(entity);
 
-    while app.world_mut().query::<&Session>().iter(app.world()).len() == 0 {
-        app.update();
+    if after_session {
+        while app.world_mut().query::<&Session>().iter(app.world()).len() == 0 {
+            app.update();
+        }
     }
     tx_go.send(()).unwrap();
     rx_closed.recv_timeout(Duration::from_secs(10)).unwrap();
